@@ -60,7 +60,7 @@ In `claude_desktop_config.json` (or via `claude mcp add`):
 
 | Tool | Description |
 |------|-------------|
-| `computer_screenshot(monitor, region, base64)` | Screenshot. `monitor=0` = all, `1+` = specific. `region="x,y,w,h"` crop. `base64=True` returns inline data URI for remote clients. |
+| `computer_screenshot(monitor, region, inline_b64)` | Screenshot. `monitor=0` = all, `1+` = specific. `region="x,y,w,h"` crop. `inline_b64=True` returns inline `data:image/png;base64,...` URI for remote clients. |
 | `analyze_screen(question, monitor)` | Send screenshot to vision AI. Returns text description. |
 | `get_monitors()` | List connected monitors with bounds, resolution, primary flag. |
 | `screen_record(duration, fps, region, monitor)` | Record short video to `data/videos/` for agent replay debugging. |
