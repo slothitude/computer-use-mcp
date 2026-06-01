@@ -62,21 +62,9 @@ def _trace(tool_name, result, elapsed=None):
     _action_trace.append(entry)
 
 
-# ── RapidOCR ────────────────────────────────────────────────────────────────────
+# ── RapidOCR Remote Service ───────────────────────────────────────────────────
 
-_rapid_ocr = None
-
-
-def _get_rapid_ocr():
-    """Lazy-init RapidOCR for fast local OCR."""
-    global _rapid_ocr
-    if _rapid_ocr is None:
-        try:
-            from rapidocr_onnxruntime import RapidOCR
-            _rapid_ocr = RapidOCR()
-        except ImportError:
-            return None
-    return _rapid_ocr
+OCR_SERVICE_URL = os.getenv("OCR_SERVICE_URL", "http://192.168.0.33:8100/ocr")
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────────────
@@ -876,7 +864,7 @@ def screen_diff(region: str = "", baseline_path: str = "",
 
 @mcp.tool()
 def screen_ocr(region: str = "", question: str = "") -> str:
-    """Extract text from the screen. Uses RapidOCR locally (sub-100ms).
+    """Extract text from the screen. Uses RapidOCR remote service for fast OCR.
     Falls back to vision model only when a question is asked.
 
     Args:
@@ -901,17 +889,23 @@ def screen_ocr(region: str = "", question: str = "") -> str:
         _trace("screen_ocr", {"vision_model": True}, time.time() - t0)
         return result
 
-    # Fast path: RapidOCR (local, no HTTP)
-    ocr = _get_rapid_ocr()
-    if ocr:
-        import numpy as np
-        arr = np.array(img)
-        results, _ = ocr(arr)
-        if results:
-            lines = [line[1] for line in results]
-            text = "\n".join(lines)
-            _trace("screen_ocr", {"rapid_ocr": True, "lines": len(lines)}, time.time() - t0)
-            return text
+    # Fast path: RapidOCR remote service (HTTP)
+    try:
+        buf = BytesIO()
+        img.save(buf, format="JPEG", quality=85)
+        b64 = base64.b64encode(buf.getvalue()).decode()
+        payload = json.dumps({"image": b64}).encode()
+        req = urllib.request.Request(
+            OCR_SERVICE_URL, data=payload,
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            result = json.loads(resp.read())
+        if result.get("lines", 0) > 0:
+            _trace("screen_ocr", {"rapid_ocr": True, "lines": result["lines"]}, time.time() - t0)
+            return result["text"]
+    except Exception:
+        pass  # Fall through to vision model
 
     # Fallback: vision model
     prompt = "Extract all visible text from this image. Return only the text content, preserving layout."
@@ -1176,19 +1170,23 @@ def process_list(name_filter: str = "") -> dict:
     Args:
         name_filter: Process name to filter by (e.g. 'chrome', 'python')
     """
-    import wmi
+    import psutil
     try:
-        c = wmi.WMI()
-        processes = []
         filter_lower = name_filter.lower() if name_filter else ""
-        for proc in c.Win32_Process():
-            if filter_lower and filter_lower not in proc.Name.lower():
+        processes = []
+        for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+            try:
+                name = proc.info['name'] or ""
+                if filter_lower and filter_lower not in name.lower():
+                    continue
+                cmdline = " ".join(proc.info['cmdline'] or [])[:200]
+                processes.append({
+                    "pid": proc.info['pid'],
+                    "name": name,
+                    "cmdline": cmdline,
+                })
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
                 continue
-            processes.append({
-                "pid": proc.ProcessId,
-                "name": proc.Name,
-                "cmdline": (proc.CommandLine or "")[:200],
-            })
         return {"processes": processes, "count": len(processes)}
     except Exception as e:
         return {"error": str(e)}
