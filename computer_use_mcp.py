@@ -51,6 +51,20 @@ print(f"[computer-use] NVIDIA_API_KEY={'***set***' if NVIDIA_API_KEY else '(empt
 
 MULTI_SCALE_STEPS = [0.75, 0.8, 0.9, 1.0, 1.1, 1.2, 1.25]
 
+# HSV color ranges for element detection (H: 0-180, S: 0-255, V: 0-255)
+# Red needs two ranges due to hue wrap-around.
+_COLOR_HSV_RANGES = {
+    "red": [(0, 70, 50), (10, 255, 255), (170, 70, 50), (180, 255, 255)],
+    "green": [(35, 70, 50), (85, 255, 255)],
+    "blue": [(100, 70, 50), (130, 255, 255)],
+    "yellow": [(20, 70, 50), (35, 255, 255)],
+    "orange": [(10, 70, 50), (20, 255, 255)],
+    "purple": [(130, 70, 50), (160, 255, 255)],
+    "white": [(0, 0, 200), (180, 50, 255)],
+    "gray": [(0, 0, 80), (180, 50, 200)],
+    "black": [(0, 0, 0), (180, 255, 80)],
+}
+
 # ── Action Trace ──────────────────────────────────────────────────────────────
 # In-memory deque recording every tool call for crash diagnosis.
 
@@ -296,64 +310,13 @@ def analyze_screen(question: str = "Describe what is on screen and any notable U
 
 # ── Template Matching ──────────────────────────────────────────────────────────
 
-@mcp.tool()
-def save_template(name: str, x: int, y: int, width: int, height: int,
-                  monitor: int = 0) -> dict:
-    """Crop a region from the current screen as a reusable template for find_on_screen.
-
-    Args:
-        name: Template name (alphanumeric, underscores, hyphens)
-        x: Left edge X coordinate
-        y: Top edge Y coordinate
-        width: Region width in pixels
-        height: Region height in pixels
-        monitor: Monitor to capture from (0=all, 1+=specific)
-    """
-    tpl_dir = DATA_DIR / "templates"
-    tpl_dir.mkdir(parents=True, exist_ok=True)
-    safe_name = re.sub(r'[^a-zA-Z0-9_\-.]', '_', name)
-    tpl_path = tpl_dir / f"{safe_name}.png"
-    if tpl_path.resolve().parent != tpl_dir.resolve():
-        return {"error": "Invalid template name."}
-    img = _grab_monitor(monitor)
-    if img is None:
-        return {"error": f"Invalid monitor index {monitor}."}
-    cropped = img.crop((x, y, x + width, y + height))
-    cropped.save(str(tpl_path))
-    return {"saved": safe_name, "path": str(tpl_path), "width": width, "height": height}
-
-
-@mcp.tool()
-def find_on_screen(template: str, threshold: float = 0.8,
-                   multi_scale: bool = True, monitor: int = 0) -> dict:
-    """Find a template image on screen via OpenCV template matching.
-    Supports multi-scale matching to handle DPI/zoom differences.
-
-    Args:
-        template: Template name (without .png extension, must be saved first)
-        threshold: Match confidence threshold 0-1 (default 0.8)
-        multi_scale: Try multiple scales if initial match fails (default True)
-        monitor: Monitor to search on (0=all, 1+=specific)
-    """
+def _match_template_method(screen_cv, tpl_pil, threshold, multi_scale):
+    """Multi-scale template matching using TM_CCOEFF_NORMED.
+    Returns dict with found/best/confidence/scale/count/all_matches."""
     import cv2
     import numpy as np
 
-    tpl_dir = DATA_DIR / "templates"
-    tpl_path = tpl_dir / f"{template}.png"
-    if not tpl_path.is_file():
-        return {"found": False, "error": f"Template '{template}' not found. Save one first with save_template."}
-    tpl_pil = cv2.imread(str(tpl_path), cv2.IMREAD_COLOR)
-    if tpl_pil is None:
-        return {"found": False, "error": f"Failed to read template '{template}'."}
-
-    img = _grab_monitor(monitor)
-    if img is None:
-        return {"found": False, "error": f"Invalid monitor index {monitor}."}
-    screen_cv = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
-
-    # Try at original scale first, then multi-scale if needed
     scales = [1.0] if not multi_scale else MULTI_SCALE_STEPS
-
     best_result = {"found": False, "count": 0}
 
     for scale in scales:
@@ -384,7 +347,6 @@ def find_on_screen(template: str, threshold: float = 0.8,
             }
 
     if best_result["found"]:
-        # Count all matches at best scale
         scale = best_result["scale"]
         if scale != 1.0:
             w = int(tpl_pil.shape[1] * scale)
@@ -399,6 +361,144 @@ def find_on_screen(template: str, threshold: float = 0.8,
         best_result["all_matches"] = [{"x": int(p[0]), "y": int(p[1])} for p in points]
 
     return best_result
+
+
+def _match_feature_method(screen_cv, tpl_cv, threshold):
+    """ORB feature matching with RANSAC homography.
+    Returns dict with found/best/confidence or found=False."""
+    import cv2
+    import numpy as np
+
+    orb = cv2.ORB_create(nfeatures=1000)
+    kp1, des1 = orb.detectAndCompute(tpl_cv, None)
+    kp2, des2 = orb.detectAndCompute(screen_cv, None)
+
+    if des1 is None or des2 is None or len(des1) < 4 or len(des2) < 4:
+        return {"found": False}
+
+    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
+    matches = bf.knnMatch(des1, des2, k=2)
+
+    # Lowe ratio test
+    good = []
+    for pair in matches:
+        if len(pair) == 2:
+            m, n = pair
+            if m.distance < 0.75 * n.distance:
+                good.append(m)
+
+    if len(good) < 4:
+        return {"found": False}
+
+    src_pts = np.float32([kp1[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
+    dst_pts = np.float32([kp2[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
+    H, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
+
+    if H is None:
+        return {"found": False}
+
+    inlier_mask = mask.ravel().tolist()
+    inliers = sum(1 for v in inlier_mask if v == 1)
+    if inliers < 4:
+        return {"found": False}
+
+    confidence = inliers / len(good)
+
+    # Scale threshold for feature matching (ORB ratios are typically 0.3-0.8 vs TM's 0.7-0.99)
+    effective_threshold = threshold * 0.6
+    if confidence < effective_threshold:
+        return {"found": False}
+
+    # Project template corners to screen
+    h, w = tpl_cv.shape[:2]
+    corners = np.float32([[0, 0], [w, 0], [w, h], [0, h]]).reshape(-1, 1, 2)
+    projected = cv2.perspectiveTransform(corners, H)
+    xs = projected[:, 0, 0]
+    ys = projected[:, 0, 1]
+    x, y = int(min(xs)), int(min(ys))
+    bw, bh = int(max(xs)) - x, int(max(ys)) - y
+
+    return {
+        "found": True,
+        "best": {"x": x, "y": y},
+        "confidence": round(float(confidence), 4),
+        "template_size": {"width": bw, "height": bh},
+        "method": "feature",
+        "inliers": inliers,
+        "total_good": len(good),
+    }
+
+
+@mcp.tool()
+def save_template(name: str, x: int, y: int, width: int, height: int,
+                  monitor: int = 0) -> dict:
+    """Crop a region from the current screen as a reusable template for find_on_screen.
+
+    Args:
+        name: Template name (alphanumeric, underscores, hyphens)
+        x: Left edge X coordinate
+        y: Top edge Y coordinate
+        width: Region width in pixels
+        height: Region height in pixels
+        monitor: Monitor to capture from (0=all, 1+=specific)
+    """
+    tpl_dir = DATA_DIR / "templates"
+    tpl_dir.mkdir(parents=True, exist_ok=True)
+    safe_name = re.sub(r'[^a-zA-Z0-9_\-.]', '_', name)
+    tpl_path = tpl_dir / f"{safe_name}.png"
+    if tpl_path.resolve().parent != tpl_dir.resolve():
+        return {"error": "Invalid template name."}
+    img = _grab_monitor(monitor)
+    if img is None:
+        return {"error": f"Invalid monitor index {monitor}."}
+    cropped = img.crop((x, y, x + width, y + height))
+    cropped.save(str(tpl_path))
+    return {"saved": safe_name, "path": str(tpl_path), "width": width, "height": height}
+
+
+@mcp.tool()
+def find_on_screen(template: str, threshold: float = 0.8,
+                   multi_scale: bool = True, monitor: int = 0,
+                   method: str = "auto") -> dict:
+    """Find a template image on screen via OpenCV template matching.
+    Supports multi-scale matching to handle DPI/zoom differences.
+    Can use ORB feature matching for better resilience to rotation/scale.
+
+    Args:
+        template: Template name (without .png extension, must be saved first)
+        threshold: Match confidence threshold 0-1 (default 0.8)
+        multi_scale: Try multiple scales if initial match fails (default True)
+        monitor: Monitor to search on (0=all, 1+=specific)
+        method: "auto" (try ORB first, fall back to template), "feature" (ORB only),
+                or "template" (template matching only, default behavior)
+    """
+    import cv2
+    import numpy as np
+
+    tpl_dir = DATA_DIR / "templates"
+    tpl_path = tpl_dir / f"{template}.png"
+    if not tpl_path.is_file():
+        return {"found": False, "error": f"Template '{template}' not found. Save one first with save_template."}
+    tpl_cv = cv2.imread(str(tpl_path), cv2.IMREAD_COLOR)
+    if tpl_cv is None:
+        return {"found": False, "error": f"Failed to read template '{template}'."}
+
+    img = _grab_monitor(monitor)
+    if img is None:
+        return {"found": False, "error": f"Invalid monitor index {monitor}."}
+    screen_cv = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+
+    if method == "feature":
+        return _match_feature_method(screen_cv, tpl_cv, threshold)
+
+    if method == "template":
+        return _match_template_method(screen_cv, tpl_cv, threshold, multi_scale)
+
+    # Auto: try feature first, fall back to template
+    result = _match_feature_method(screen_cv, tpl_cv, threshold)
+    if result.get("found"):
+        return result
+    return _match_template_method(screen_cv, tpl_cv, threshold, multi_scale)
 
 
 @mcp.tool()
@@ -475,6 +575,332 @@ def find_and_click_all(template: str, button: str = "left", threshold: float = 0
 
     return {"clicked": len(clustered), "matches": len(all_centers),
             "points": [{"x": c["x"], "y": c["y"]} for c in clustered]}
+
+
+# ── UI Element Detection ──────────────────────────────────────────────────────
+
+def _parse_element_query(query):
+    """Parse a natural-language query into color and shape extraction hints.
+    Returns dict: colors=[...], shapes=[...], mode='color'|'shape'|'color_shape'|'default'"""
+    q = query.lower()
+    color_map = {
+        "red": "red", "blue": "blue", "green": "green", "yellow": "yellow",
+        "orange": "orange", "purple": "purple", "white": "white", "gray": "gray",
+        "grey": "gray", "black": "black",
+    }
+    colors = [color_map[w] for w in color_map if w in q]
+    # Deduplicate preserving order
+    seen = set()
+    colors = [c for c in colors if not (c in seen or seen.add(c))]
+
+    shapes = []
+    shape_map = {
+        "button": "rectangle", "rect": "rectangle", "rectangle": "rectangle",
+        "square": "rectangle", "box": "rectangle", "bar": "rectangle",
+        "circle": "circle", "round": "circle", "dot": "circle",
+        "oval": "circle", "ellipse": "circle",
+        "icon": "blob", "blob": "blob", "shape": "blob",
+        "close": "circle",
+    }
+    for word, shape in shape_map.items():
+        if word in q:
+            shapes.append(shape)
+    seen_s = set()
+    shapes = [s for s in shapes if not (s in seen_s or seen_s.add(s))]
+
+    # Special: "close button" means red circle
+    if "close" in q and "button" in q:
+        colors = ["red"]
+        shapes = ["circle"]
+    elif "close" in q:
+        colors = colors or ["red"]
+        shapes = ["circle"]
+
+    if colors and shapes:
+        mode = "color_shape"
+    elif colors:
+        mode = "color"
+    elif shapes:
+        mode = "shape"
+    else:
+        mode = "default"
+
+    return {"colors": colors, "shapes": shapes, "mode": mode}
+
+
+def _apply_color_mask(screen_cv, color_name):
+    """Apply HSV mask for a color name. Returns masked image (white=match)."""
+    import cv2
+    import numpy as np
+
+    hsv = cv2.cvtColor(screen_cv, cv2.COLOR_BGR2HSV)
+    ranges = _COLOR_HSV_RANGES.get(color_name)
+    if ranges is None:
+        return None
+
+    if len(ranges) == 4:  # Two ranges (red)
+        lo1, hi1, lo2, hi2 = ranges
+        mask1 = cv2.inRange(hsv, np.array(lo1), np.array(hi1))
+        mask2 = cv2.inRange(hsv, np.array(lo2), np.array(hi2))
+        return cv2.bitwise_or(mask1, mask2)
+    else:
+        lo, hi = ranges[0], ranges[1]
+        return cv2.inRange(hsv, np.array(lo), np.array(hi))
+
+
+def _detect_by_color(screen_cv, color_name, min_area):
+    """Detect regions matching a color. Returns list of element dicts."""
+    import cv2
+
+    mask = _apply_color_mask(screen_cv, color_name)
+    if mask is None:
+        return []
+
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    elements = []
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if area < min_area:
+            continue
+        x, y, w, h = cv2.boundingRect(cnt)
+        elements.append({
+            "x": x, "y": y, "width": w, "height": h,
+            "center_x": x + w // 2, "center_y": y + h // 2,
+            "color": color_name, "shape": None, "area": int(area),
+        })
+    return elements
+
+
+def _detect_by_shape(screen_cv, shape_name, min_area):
+    """Detect contours matching a shape. Returns list of element dicts."""
+    import cv2
+    import numpy as np
+
+    gray = cv2.cvtColor(screen_cv, cv2.COLOR_BGR2GRAY)
+    edges = cv2.Canny(gray, 50, 150)
+    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    elements = []
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if area < min_area:
+            continue
+
+        x, y, w, h = cv2.boundingRect(cnt)
+        perimeter = cv2.arcLength(cnt, True)
+
+        detected_shape = None
+        if shape_name == "rectangle":
+            # approxPolyDP: 4 vertices = rectangle-ish
+            approx = cv2.approxPolyDP(cnt, 0.02 * perimeter, True)
+            if len(approx) == 4:
+                detected_shape = "rectangle"
+        elif shape_name == "circle":
+            # Circularity check
+            if perimeter > 0:
+                circularity = 4 * np.pi * area / (perimeter * perimeter)
+                if circularity > 0.85:
+                    detected_shape = "circle"
+        elif shape_name == "blob":
+            # Any significant contour
+            detected_shape = "blob"
+
+        if detected_shape:
+            elements.append({
+                "x": x, "y": y, "width": w, "height": h,
+                "center_x": x + w // 2, "center_y": y + h // 2,
+                "color": None, "shape": detected_shape, "area": int(area),
+            })
+
+    return elements
+
+
+def _detect_by_color_shape(screen_cv, color_name, shape_name, min_area):
+    """Detect regions matching both a color and shape. Returns list of element dicts."""
+    import cv2
+    import numpy as np
+
+    mask = _apply_color_mask(screen_cv, color_name)
+    if mask is None:
+        return []
+
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    elements = []
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if area < min_area:
+            continue
+
+        x, y, w, h = cv2.boundingRect(cnt)
+        perimeter = cv2.arcLength(cnt, True)
+
+        match = False
+        detected_shape = None
+        if shape_name == "rectangle":
+            approx = cv2.approxPolyDP(cnt, 0.02 * perimeter, True)
+            match = len(approx) == 4
+            detected_shape = "rectangle"
+        elif shape_name == "circle":
+            if perimeter > 0:
+                circularity = 4 * np.pi * area / (perimeter * perimeter)
+                match = circularity > 0.85
+                detected_shape = "circle"
+        elif shape_name == "blob":
+            match = True
+            detected_shape = "blob"
+
+        if match:
+            elements.append({
+                "x": x, "y": y, "width": w, "height": h,
+                "center_x": x + w // 2, "center_y": y + h // 2,
+                "color": color_name, "shape": detected_shape, "area": int(area),
+            })
+
+    return elements
+
+
+def _detect_default(screen_cv, min_area):
+    """Default detection: find all significant contours (no color/shape filter).
+    Returns list of element dicts."""
+    import cv2
+
+    gray = cv2.cvtColor(screen_cv, cv2.COLOR_BGR2GRAY)
+    edges = cv2.Canny(gray, 50, 150)
+    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    elements = []
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if area < min_area:
+            continue
+        x, y, w, h = cv2.boundingRect(cnt)
+        elements.append({
+            "x": x, "y": y, "width": w, "height": h,
+            "center_x": x + w // 2, "center_y": y + h // 2,
+            "color": None, "shape": None, "area": int(area),
+        })
+    return elements
+
+
+def _nms_elements(elements, overlap_threshold=0.3):
+    """Non-max suppression by IoU to remove overlapping detections."""
+    if not elements:
+        return []
+
+    # Sort by area descending (prefer larger detections)
+    elements.sort(key=lambda e: e["area"], reverse=True)
+    keep = []
+
+    for elem in elements:
+        too_close = False
+        for kept in keep:
+            # Compute IoU
+            x1 = max(elem["x"], kept["x"])
+            y1 = max(elem["y"], kept["y"])
+            x2 = min(elem["x"] + elem["width"], kept["x"] + kept["width"])
+            y2 = min(elem["y"] + elem["height"], kept["y"] + kept["height"])
+
+            inter = max(0, x2 - x1) * max(0, y2 - y1)
+            union = elem["area"] + kept["area"] - inter
+            if union > 0 and inter / union > overlap_threshold:
+                too_close = True
+                break
+        if not too_close:
+            keep.append(elem)
+
+    return keep
+
+
+@mcp.tool()
+def find_elements(query: str, region: str = "", min_area: int = 500,
+                  monitor: int = 0) -> dict:
+    """Find UI elements on screen by color, shape, or both — no template needed.
+    Uses OpenCV contour detection, HSV color masking, and shape classification.
+
+    Args:
+        query: What to find, e.g. "blue buttons", "red circles", "close button", "icons"
+        region: Optional crop region as 'x,y,w,h'
+        min_area: Minimum contour area in pixels (default 500, filters noise)
+        monitor: Monitor to search (0=all, 1+=specific)
+    """
+    import cv2
+    import numpy as np
+
+    img = _grab_monitor(monitor)
+    if img is None:
+        return {"error": f"Invalid monitor index {monitor}."}
+
+    if region:
+        try:
+            parts = [int(p.strip()) for p in region.split(",")]
+            if len(parts) == 4:
+                img = img.crop((parts[0], parts[1], parts[0] + parts[2], parts[1] + parts[3]))
+        except ValueError:
+            pass
+
+    screen_cv = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+    parsed = _parse_element_query(query)
+
+    elements = []
+    if parsed["mode"] == "color_shape":
+        # For each color+shape combination
+        for color in parsed["colors"]:
+            for shape in parsed["shapes"]:
+                elements.extend(_detect_by_color_shape(screen_cv, color, shape, min_area))
+    elif parsed["mode"] == "color":
+        for color in parsed["colors"]:
+            elements.extend(_detect_by_color(screen_cv, color, min_area))
+    elif parsed["mode"] == "shape":
+        for shape in parsed["shapes"]:
+            elements.extend(_detect_by_shape(screen_cv, shape, min_area))
+    else:
+        elements = _detect_default(screen_cv, min_area)
+
+    elements = _nms_elements(elements)
+
+    return {
+        "count": len(elements),
+        "query": query,
+        "parsed": {"colors": parsed["colors"], "shapes": parsed["shapes"], "mode": parsed["mode"]},
+        "elements": elements[:50],  # cap to prevent huge responses
+    }
+
+
+@mcp.tool()
+def click_element(query: str, index: int = 0, min_area: int = 500,
+                  monitor: int = 0) -> dict:
+    """Find a UI element by description and click it.
+    Uses find_elements internally to locate the target, then clicks at its center.
+
+    Args:
+        query: What to find, e.g. "blue button", "red circle", "close button"
+        index: Which element to click (0 = first, default)
+        min_area: Minimum contour area (default 500)
+        monitor: Monitor to search (0=all, 1+=specific)
+    """
+    import pyautogui
+
+    result = find_elements(query=query, min_area=min_area, monitor=monitor)
+    if "error" in result:
+        return result
+
+    elements = result.get("elements", [])
+    if not elements:
+        return {"clicked": False, "error": f"No elements found matching '{query}'."}
+
+    if index >= len(elements):
+        return {"clicked": False, "error": f"Index {index} out of range. Found {len(elements)} elements."}
+
+    elem = elements[index]
+    pyautogui.click(x=elem["center_x"], y=elem["center_y"])
+
+    return {
+        "clicked": True,
+        "element": elem,
+        "index": index,
+        "total_found": len(elements),
+    }
 
 
 # ── Mouse ───────────────────────────────────────────────────────────────────────
