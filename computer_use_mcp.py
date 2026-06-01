@@ -1,14 +1,15 @@
 """Computer Use MCP Server — PyAutoGUI + OpenCV + Ollama/NVIDIA vision.
 
 Controls the local desktop (mouse, keyboard, screenshots, screen understanding,
-window management, pixel color, OCR, clipboard).
+window management, pixel color, OCR, clipboard, accessibility tree, shell).
 Runs as stdio MCP server via FastMCP.
 
 Config via environment variables:
     VISION_BACKEND         - Vision provider: "ollama" (default) or "nvidia"
     COMPUTER_VISION_MODEL  - Ollama vision model (default: qwen2.5vl:3b)
     OLLAMA_BASE            - Ollama API base URL (default: http://localhost:11434)
-    NVIDIA_VISION_URL      - NVIDIA NIM endpoint (default: https://ai.api.nvidia.com/v1/vlm/google/paligemma)
+    NVIDIA_VISION_URL      - NVIDIA NIM endpoint (default: https://integrate.api.nvidia.com/v1/chat/completions)
+    NVIDIA_VISION_MODEL    - NVIDIA model (default: meta/llama-3.2-90b-vision-instruct)
     NVIDIA_API_KEY         - NVIDIA API bearer token
     VISION_TIMEOUT         - Vision API timeout seconds (default: 300)
     SCREEN_MAX_DIMENSION   - Max dimension for vision screenshots (default: 1280)
@@ -18,8 +19,10 @@ import base64
 import json
 import os
 import re
+import subprocess
 import time
 import urllib.request
+from collections import deque
 from io import BytesIO
 from pathlib import Path
 
@@ -40,6 +43,40 @@ SCREEN_MAX_DIMENSION = int(os.getenv("SCREEN_MAX_DIMENSION", "1280"))
 DATA_DIR = Path(os.getenv("COMPUTER_USE_DATA_DIR", "data"))
 
 MULTI_SCALE_STEPS = [0.75, 0.8, 0.9, 1.0, 1.1, 1.2, 1.25]
+
+# ── Action Trace ──────────────────────────────────────────────────────────────
+# In-memory deque recording every tool call for crash diagnosis.
+
+_action_trace = deque(maxlen=100)
+
+
+def _trace(tool_name, result, elapsed=None):
+    """Record a tool call in the action trace."""
+    entry = {"tool": tool_name, "timestamp": time.time(), "elapsed": round(elapsed, 3) if elapsed else None}
+    if isinstance(result, dict):
+        entry.update({k: v for k, v in result.items() if k != "error"})
+        if "error" in result:
+            entry["error"] = result["error"]
+    else:
+        entry["result_preview"] = str(result)[:200]
+    _action_trace.append(entry)
+
+
+# ── RapidOCR ────────────────────────────────────────────────────────────────────
+
+_rapid_ocr = None
+
+
+def _get_rapid_ocr():
+    """Lazy-init RapidOCR for fast local OCR."""
+    global _rapid_ocr
+    if _rapid_ocr is None:
+        try:
+            from rapidocr_onnxruntime import RapidOCR
+            _rapid_ocr = RapidOCR()
+        except ImportError:
+            return None
+    return _rapid_ocr
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────────────
@@ -518,11 +555,37 @@ def computer_type(text: str, interval: float = 0.05) -> dict:
         interval: Seconds between keystrokes (default 0.05)
     """
     import pyautogui
-    combo_match = re.match(r'^([a-z]+(?:\+[a-z]+)+)$', text.strip().lower())
-    if combo_match:
-        keys = combo_match.group(1).split('+')
+
+    # Known key names for hotkey detection
+    _KNOWN_KEYS = {
+        "ctrl", "alt", "shift", "win", "cmd", "super", "fn",
+        "a","b","c","d","e","f","g","h","i","j","k","l","m",
+        "n","o","p","q","r","s","t","u","v","w","x","y","z",
+        "0","1","2","3","4","5","6","7","8","9",
+        "f1","f2","f3","f4","f5","f6","f7","f8","f9","f10","f11","f12",
+        "f13","f14","f15","f16","f17","f18","f19","f20","f21","f22","f23","f24",
+        "enter", "return", "tab", "escape", "esc", "space", "backspace",
+        "delete", "del", "home", "end", "pageup", "pgup", "pagedown", "pgdn",
+        "up", "down", "left", "right",
+        "insert", "ins", "printscreen", "scrolllock", "numlock", "capslock",
+        "plus", "minus", "comma", "period", "slash", "backslash",
+        "apps", "menu",
+    }
+
+    parts = text.strip().split('+')
+    if len(parts) > 1:
+        # Hotkey mode: all parts must be known keys
+        keys = [p.lower().strip() for p in parts]
+        unknown = [k for k in keys if k not in _KNOWN_KEYS]
+        if unknown:
+            return {"error": f"Unknown key(s) in combo: {unknown}. Valid keys include letters, f1-f24, enter, tab, escape, etc."}
         pyautogui.hotkey(*keys, interval=interval)
         return {"hotkey": keys}
+    # Special single keys
+    single = text.strip().lower()
+    if single in _KNOWN_KEYS:
+        pyautogui.press(single)
+        return {"pressed": single}
     pyautogui.write(text, interval=interval)
     return {"typed": text}
 
@@ -813,13 +876,14 @@ def screen_diff(region: str = "", baseline_path: str = "",
 
 @mcp.tool()
 def screen_ocr(region: str = "", question: str = "") -> str:
-    """Extract text from the screen using Ollama vision. Crops a region
-    and sends it to the vision model with an OCR prompt.
+    """Extract text from the screen. Uses RapidOCR locally (sub-100ms).
+    Falls back to vision model only when a question is asked.
 
     Args:
         region: Region to OCR as 'x,y,w,h'. Empty = full screen.
         question: Optional specific question (e.g. 'What is the price shown?')
     """
+    t0 = time.time()
     bbox = None
     if region:
         try:
@@ -830,8 +894,30 @@ def screen_ocr(region: str = "", question: str = "") -> str:
             return json.dumps({"error": f"Invalid region format '{region}'."})
 
     img = _grab(bbox=bbox)
-    prompt = question if question else "Extract all visible text from this image. Return only the text content, preserving layout."
-    return _vision_call(img, prompt)
+
+    # If a question is asked, use vision model
+    if question:
+        result = _vision_call(img, question)
+        _trace("screen_ocr", {"vision_model": True}, time.time() - t0)
+        return result
+
+    # Fast path: RapidOCR (local, no HTTP)
+    ocr = _get_rapid_ocr()
+    if ocr:
+        import numpy as np
+        arr = np.array(img)
+        results, _ = ocr(arr)
+        if results:
+            lines = [line[1] for line in results]
+            text = "\n".join(lines)
+            _trace("screen_ocr", {"rapid_ocr": True, "lines": len(lines)}, time.time() - t0)
+            return text
+
+    # Fallback: vision model
+    prompt = "Extract all visible text from this image. Return only the text content, preserving layout."
+    result = _vision_call(img, prompt)
+    _trace("screen_ocr", {"vision_model": True}, time.time() - t0)
+    return result
 
 
 # ── Clipboard Image ─────────────────────────────────────────────────────────────
@@ -900,6 +986,336 @@ def clipboard_set_image(path: str) -> dict:
         return {"copied": str(p), "width": img.width, "height": img.height}
     except Exception as e:
         return {"error": f"Failed to copy image: {e}"}
+
+
+# ── Accessibility Tree ─────────────────────────────────────────────────────────
+
+@mcp.tool()
+def accessibility_tree(title_or_handle: str = "", depth: int = 5) -> dict:
+    """Get the UI Automation (UIA) tree for a window.
+    Returns element names, types, automation IDs, bounding rectangles, and states.
+    Use this to find clickable elements by AutomationId instead of pixel coordinates.
+
+    Args:
+        title_or_handle: Window title substring or handle ID (empty = foreground window)
+        depth: Max tree depth (default 5)
+    """
+    from pywinauto import Desktop
+    try:
+        desktop = Desktop(backend="uia")
+        if title_or_handle.strip():
+            handle_str = title_or_handle.strip()
+            try:
+                hwnd = int(handle_str)
+                window = desktop.window(handle=hwnd)
+            except ValueError:
+                window = desktop.window(title_re=".*" + re.escape(handle_str) + ".*")
+        else:
+            window = desktop.top_window()
+
+        def _walk(element, d):
+            if d > depth:
+                return None
+            try:
+                info = element.element_info
+                node = {
+                    "name": info.name[:100] if info.name else "",
+                    "type": info.class_name,
+                    "automation_id": info.automation_id if info.automation_id else "",
+                    "visible": info.visible,
+                }
+                rect = info.rectangle
+                if rect:
+                    node["rect"] = {"left": rect.left, "top": rect.top,
+                                    "right": rect.right, "bottom": rect.bottom}
+            except Exception:
+                return None
+            children = []
+            try:
+                for child in element.children():
+                    child_node = _walk(child, d + 1)
+                    if child_node:
+                        children.append(child_node)
+            except Exception:
+                pass
+            if children:
+                node["children"] = children
+            return node
+
+        tree = _walk(window, 0)
+        return {"window": window.window_text(), "tree": tree}
+    except Exception as e:
+        return {"error": f"Accessibility tree error: {e}"}
+
+
+@mcp.tool()
+def click_by_automation_id(automation_id: str, title_or_handle: str = "",
+                            action: str = "click") -> dict:
+    """Click a UI element by its AutomationId. Finds it via the UIA tree.
+    More reliable than pixel coordinates — works regardless of window position or DPI.
+
+    Args:
+        automation_id: The AutomationId of the target element
+        title_or_handle: Window to search in (empty = foreground)
+        action: "click", "double_click", "right_click", or "invoke"
+    """
+    from pywinauto import Desktop
+    try:
+        desktop = Desktop(backend="uia")
+        if title_or_handle.strip():
+            try:
+                hwnd = int(title_or_handle.strip())
+                window = desktop.window(handle=hwnd)
+            except ValueError:
+                window = desktop.window(title_re=".*" + re.escape(title_or_handle) + ".*")
+        else:
+            window = desktop.top_window()
+
+        def _find_by_id(element, target_id):
+            try:
+                info = element.element_info
+                if info.automation_id == target_id:
+                    return element
+            except Exception:
+                pass
+            try:
+                for child in element.children():
+                    found = _find_by_id(child, target_id)
+                    if found:
+                        return found
+            except Exception:
+                pass
+            return None
+
+        elem = _find_by_id(window, automation_id)
+        if not elem:
+            return {"error": f"AutomationId '{automation_id}' not found."}
+
+        if action == "click":
+            elem.click_input()
+        elif action == "double_click":
+            elem.double_click_input()
+        elif action == "right_click":
+            elem.right_click_input()
+        elif action == "invoke":
+            elem.invoke()
+        else:
+            return {"error": f"Unknown action '{action}'. Use click, double_click, right_click, or invoke."}
+
+        return {"clicked": automation_id, "action": action}
+    except Exception as e:
+        return {"error": f"UIA click error: {e}"}
+
+
+# ── Shell / Process Tools ──────────────────────────────────────────────────────
+
+@mcp.tool()
+def shell_run(command: str, timeout: int = 30, cwd: str = "") -> dict:
+    """Run a shell command and return output. Use for launching apps, checking processes, one-liners.
+
+    Args:
+        command: Shell command to execute
+        timeout: Max wait time in seconds (default 30)
+        cwd: Working directory (empty = current)
+    """
+    t0 = time.time()
+    try:
+        result = subprocess.run(
+            command, shell=True, capture_output=True, text=True,
+            timeout=timeout, cwd=cwd if cwd else None,
+        )
+        elapsed = round(time.time() - t0, 3)
+        entry = {"exit_code": result.returncode, "elapsed": elapsed}
+        if result.stdout:
+            out = result.stdout.strip()
+            entry["stdout"] = out[:2000]
+            if len(out) > 2000:
+                entry["stdout_truncated"] = True
+        if result.stderr:
+            err = result.stderr.strip()
+            entry["stderr"] = err[:1000]
+        _trace("shell_run", entry, elapsed)
+        return entry
+    except subprocess.TimeoutExpired:
+        _trace("shell_run", {"error": f"Timeout after {timeout}s"}, time.time() - t0)
+        return {"error": f"Command timed out after {timeout}s", "exit_code": -1}
+    except Exception as e:
+        _trace("shell_run", {"error": str(e)}, time.time() - t0)
+        return {"error": str(e), "exit_code": -1}
+
+
+@mcp.tool()
+def launch_app(name: str, args: str = "") -> dict:
+    """Launch an application by name. Handles common Windows apps.
+
+    Args:
+        name: Application name or path (e.g. 'notepad', 'chrome', 'C:\\path\\to\\app.exe')
+        args: Command line arguments
+    """
+    t0 = time.time()
+    try:
+        cmd = name if os.path.isabs(name) else f"start {name}"
+        if args:
+            cmd = f"{cmd} {args}"
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=10)
+        elapsed = round(time.time() - t0, 3)
+        entry = {"launched": name, "exit_code": result.returncode, "elapsed": elapsed}
+        if result.stderr:
+            entry["stderr"] = result.stderr.strip()[:500]
+        _trace("launch_app", entry, elapsed)
+        return entry
+    except Exception as e:
+        _trace("launch_app", {"error": str(e)}, time.time() - t0)
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def process_list(name_filter: str = "") -> dict:
+    """List running processes. Filter by name substring.
+
+    Args:
+        name_filter: Process name to filter by (e.g. 'chrome', 'python')
+    """
+    import wmi
+    try:
+        c = wmi.WMI()
+        processes = []
+        filter_lower = name_filter.lower() if name_filter else ""
+        for proc in c.Win32_Process():
+            if filter_lower and filter_lower not in proc.Name.lower():
+                continue
+            processes.append({
+                "pid": proc.ProcessId,
+                "name": proc.Name,
+                "cmdline": (proc.CommandLine or "")[:200],
+            })
+        return {"processes": processes, "count": len(processes)}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def process_kill(pid: int, force: bool = False) -> dict:
+    """Kill a process by PID.
+
+    Args:
+        pid: Process ID to kill
+        force: Force kill (default False)
+    """
+    try:
+        import signal
+        sig = signal.SIGKILL if force else signal.SIGTERM
+        os.kill(pid, sig)
+        return {"killed": pid}
+    except PermissionError:
+        # Fallback to taskkill on Windows
+        try:
+            flag = "/F" if force else ""
+            result = subprocess.run(f"taskkill {flag} /PID {pid}", shell=True, capture_output=True, text=True)
+            if result.returncode == 0:
+                return {"killed": pid}
+            return {"error": result.stderr.strip()}
+        except Exception as e:
+            return {"error": str(e)}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# ── Action Trace ──────────────────────────────────────────────────────────────
+
+@mcp.tool()
+def action_trace(clear: bool = False, last_n: int = 0) -> dict:
+    """Get the action trace log — records every tool call for crash diagnosis.
+    When a multi-step automation fails at step 8, this shows what the UI
+    state was at step 7 and every preceding step.
+
+    Args:
+        clear: Clear the trace after reading (default False)
+        last_n: Only return last N entries (0 = all)
+    """
+    entries = list(_action_trace)
+    if last_n > 0:
+        entries = entries[-last_n:]
+    if clear:
+        _action_trace.clear()
+    return {"trace": entries, "count": len(entries)}
+
+
+# ── File System Tools ──────────────────────────────────────────────────────────
+
+@mcp.tool()
+def file_read(path: str, lines: int = 0) -> dict:
+    """Read a file. Returns content as text.
+
+    Args:
+        path: File path to read
+        lines: Number of lines to read from start (0 = all)
+    """
+    p = Path(path)
+    if not p.is_file():
+        return {"error": f"File not found: {path}"}
+    try:
+        content = p.read_text(encoding="utf-8", errors="replace")
+        if lines > 0:
+            content = "\n".join(content.split("\n")[:lines])
+        return {"path": str(p), "size": len(content), "content": content}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def file_write(path: str, content: str) -> dict:
+    """Write content to a file. Creates parent directories if needed.
+
+    Args:
+        path: File path to write
+        content: Text content to write
+    """
+    p = Path(path)
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(content, encoding="utf-8")
+        return {"written": str(p), "size": len(content)}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def file_list(path: str = ".", pattern: str = "*") -> dict:
+    """List files in a directory.
+
+    Args:
+        path: Directory path (default: current)
+        pattern: Glob pattern to filter (default: *)
+    """
+    p = Path(path)
+    if not p.is_dir():
+        return {"error": f"Not a directory: {path}"}
+    try:
+        entries = []
+        for f in sorted(p.glob(pattern)):
+            entry = {"name": f.name, "path": str(f)}
+            if f.is_dir():
+                entry["type"] = "dir"
+            else:
+                entry["type"] = "file"
+                entry["size"] = f.stat().st_size
+            entries.append(entry)
+        return {"path": str(p), "entries": entries, "count": len(entries)}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def file_exists(path: str) -> dict:
+    """Check if a file or directory exists.
+
+    Args:
+        path: Path to check
+    """
+    p = Path(path)
+    return {"exists": p.exists(), "is_file": p.is_file(), "is_dir": p.is_dir(),
+            "path": str(p)}
 
 
 # ── Main ────────────────────────────────────────────────────────────────────────
