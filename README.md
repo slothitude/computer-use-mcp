@@ -2,16 +2,22 @@
 
 MCP server for desktop automation on Windows. PyAutoGUI + OpenCV + Vision AI + Win32.
 
-39 tools for mouse, keyboard, screenshots, screen understanding, window management,
-pixel color, OCR, clipboard, template matching, UI element detection, and more.
+48 tools for mouse, keyboard, screenshots, screen understanding, window management,
+pixel color, OCR, clipboard, template matching, UI element detection, recording, and more.
 
 ## Setup
 
 ```bash
-pip install mcp pyautogui opencv-contrib-python Pillow pywin32 psutil
+pip install mcp pyautogui opencv-contrib-python Pillow pywin32 psutil pywinauto
 ```
 
 > Use `opencv-contrib-python` (not `opencv-python`) for ORB feature matching.
+> `pywinauto` required for UIA/accessibility tools.
+
+**Optional** (for local OCR fallback):
+```bash
+pip install rapidocr-onnxruntime
+```
 
 **Environment variables:**
 
@@ -27,6 +33,7 @@ pip install mcp pyautogui opencv-contrib-python Pillow pywin32 psutil
 | `SCREEN_MAX_DIMENSION` | `1280` | Max dimension for vision screenshots |
 | `COMPUTER_USE_DATA_DIR` | `data` | Directory for templates and screenshots |
 | `OCR_SERVICE_URL` | `http://192.168.0.33:8100/ocr` | Remote RapidOCR endpoint |
+| `TRACE_LOG_PATH` | *(disabled)* | Set to a JSONL path to persist action trace to disk |
 
 ## Adding to Claude Desktop
 
@@ -53,31 +60,30 @@ In `claude_desktop_config.json` (or via `claude mcp add`):
 
 | Tool | Description |
 |------|-------------|
-| `computer_screenshot(monitor, region)` | Screenshot. `monitor=0` = all screens, `1+` = specific. Optional `region="x,y,w,h"` crop. |
-| `analyze_screen(question, monitor)` | Send screenshot to vision AI (Ollama or NVIDIA NIM). Returns text description. |
-| `get_monitors()` | List all connected monitors with bounds, resolution, and primary flag. |
+| `computer_screenshot(monitor, region, base64)` | Screenshot. `monitor=0` = all, `1+` = specific. `region="x,y,w,h"` crop. `base64=True` returns inline data URI for remote clients. |
+| `analyze_screen(question, monitor)` | Send screenshot to vision AI. Returns text description. |
+| `get_monitors()` | List connected monitors with bounds, resolution, primary flag. |
+| `screen_record(duration, fps, region, monitor)` | Record short video to `data/videos/` for agent replay debugging. |
 
 ### Template Matching
 
 | Tool | Description |
 |------|-------------|
-| `save_template(name, x, y, width, height, monitor)` | Crop a screen region and save as a reusable template (stored in `data/templates/`). |
-| `find_on_screen(template, threshold, multi_scale, monitor, method)` | Find a template on screen. Three methods: |
-| | `method="auto"` (default) — ORB feature matching first, falls back to template matching |
-| | `method="feature"` — ORB only. Best for rotation/scale changes. |
-| | `method="template"` — Multi-scale pixel matching only. Original behavior. |
-| `find_and_click_all(template, button, threshold, min_distance, multi_scale)` | Find all instances of a template and click each one. Clusters nearby matches to avoid duplicates. |
+| `save_template(name, x, y, width, height, monitor)` | Crop a screen region and save as reusable template (`data/templates/`). |
+| `find_on_screen(template, threshold, multi_scale, monitor, method)` | Find a template on screen. Results are NMS-deduplicated. |
+| | `method="auto"` (default) — ORB feature matching first, falls back to template |
+| | `method="feature"` — ORB only. Best for rotation/scale. |
+| | `method="template"` — Multi-scale pixel matching only. |
+| `find_and_click_all(template, button, threshold, min_distance, multi_scale)` | Find all instances and click each. Clusters nearby matches. |
 
 ### UI Element Detection (template-free)
 
 | Tool | Description |
 |------|-------------|
-| `find_elements(query, region, min_area, monitor)` | Find UI elements by color, shape, or both — no template needed. |
+| `find_elements(query, region, min_area, monitor)` | Find UI elements by color, shape, or both — no template. Returns scored, sorted, NMS-deduplicated results. |
 | `click_element(query, index, min_area, monitor)` | Find elements and click one at its center. |
 
-**Query language for `find_elements`:**
-
-Combines color and shape keywords. Examples:
+**Query language:**
 
 | Query | What it finds |
 |-------|--------------|
@@ -88,13 +94,14 @@ Combines color and shape keywords. Examples:
 | `"icons"` | Any blob-shaped contours |
 | `"Save button"` | Rectangle-shaped elements |
 
-**Supported colors:** red, blue, green, yellow, orange, purple, white, gray, black
-**Supported shapes:** rectangle (button, rect, square, box, bar), circle (round, dot, oval, ellipse), blob (icon, shape)
+**Colors:** red, blue, green, yellow, orange, purple, white, gray, black
+**Shapes:** rectangle (button, rect, square, box, bar), circle (round, dot, oval, ellipse), blob (icon, shape)
 
 ### Mouse
 
 | Tool | Description |
 |------|-------------|
+| `mouse_position()` | Get current mouse cursor position `{x, y}`. |
 | `computer_click(x, y, button, clicks)` | Click at coordinates. Button: `left`/`right`/`middle`. |
 | `computer_move(x, y, duration)` | Move mouse without clicking. |
 | `computer_scroll(amount, direction)` | Scroll at current position. |
@@ -104,20 +111,21 @@ Combines color and shape keywords. Examples:
 
 | Tool | Description |
 |------|-------------|
-| `computer_type(text, interval)` | Type text character-by-character. Use key combos: `ctrl+a`, `alt+tab`, `enter`, `escape`. |
+| `computer_type(text, interval)` | Type text or hotkeys. Supports `ctrl+a`, `alt+tab`, `win+d`, `f1`-`f24`, `delete`, `backspace`, arrows, numpad, and all standard keys. Unknown keys in combos produce an error instead of silently typing. |
 
 ### Window Management (Win32)
 
 | Tool | Description |
 |------|-------------|
-| `window_list(title_filter, visible_only)` | Enumerate open windows. Filter by title substring. |
-| `window_focus(title_or_handle, bring_to_front)` | Bring window to foreground. Unminimizes if needed. |
+| `window_list(title_filter, visible_only)` | Enumerate open windows. |
+| `window_focus(title_or_handle, bring_to_front)` | Focus window. Uses edit-distance ranking when multiple partial matches exist. Unminimizes. |
 | `window_move(title_or_handle, x, y)` | Move window to coordinates. |
 | `window_resize(title_or_handle, width, height)` | Resize window. |
 | `window_maximize(title_or_handle)` | Maximize window. |
 | `window_minimize(title_or_handle)` | Minimize window. |
 | `window_close(title_or_handle)` | Close window gracefully. |
 | `window_screenshot(title_or_handle)` | Screenshot a specific window. |
+| `window_enumerate_controls(title_or_handle, control_type, depth)` | List all interactive controls with type, text, rect, AutomationId, enabled/visible state. Win32 accessibility snapshot. |
 
 ### Pixel Color
 
@@ -130,75 +138,84 @@ Combines color and shape keywords. Examples:
 
 | Tool | Description |
 |------|-------------|
-| `wait_for_change(region, timeout, interval, threshold)` | Block until a screen region changes visually. Polls pixel difference. |
-| `screen_diff(region, baseline_path, describe)` | Compare screen against a saved baseline image. Optionally send diff to vision model. |
+| `wait_for_change(region, timeout, interval, threshold)` | Block until a screen region changes visually. |
+| `screen_diff(region, baseline_path, describe)` | Compare screen against saved baseline. Optionally send diff to vision model. |
 
-### OCR
+### OCR (three-tier)
 
 | Tool | Description |
 |------|-------------|
-| `screen_ocr(region, question)` | Extract text via RapidOCR (fast, <100ms). Falls back to vision model for Q&A. |
+| `screen_ocr(region, question)` | Extract text: remote RapidOCR → local ONNX → vision model. Structured output from local tier includes bounding boxes. |
+| `find_on_screen_text(text, region, monitor, case_sensitive)` | Find a text string on screen via OCR. Returns match positions, line numbers, context. |
 
 ### Clipboard
 
 | Tool | Description |
 |------|-------------|
-| `clipboard_get_image()` | Copy image from system clipboard to `data/images/`. |
-| `clipboard_set_image(path)` | Copy image file to system clipboard. |
+| `clipboard_get_image()` | Copy image from clipboard to `data/images/`. |
+| `clipboard_set_image(path)` | Copy image file to clipboard. |
+| `clipboard_get_text()` | Get text content from system clipboard. |
+| `clipboard_set_text(text)` | Copy text to system clipboard. |
 
 ### Accessibility (UIA)
 
 | Tool | Description |
 |------|-------------|
-| `accessibility_tree(title_or_handle, depth)` | Get the UI Automation tree for a window. Shows element names, types, AutomationIds, bounding rects. |
-| `click_by_automation_id(automation_id, title_or_handle, action)` | Click a UI element by its AutomationId. Works regardless of window position or DPI. |
+| `accessibility_tree(title_or_handle, depth)` | Get UI Automation tree. Names, types, AutomationIds, rects. |
+| `click_by_automation_id(automation_id, title_or_handle, action)` | Click element by AutomationId. Actions: `click`, `double_click`, `right_click`, `invoke`. |
+| `ui_find(name, control_type, title_or_handle, depth)` | Find elements by name substring and/or control type. No AutomationId needed. Returns matched elements with rects. |
+| `ui_get_value(automation_id, title_or_handle)` | Read current value/text of a UI element. Useful for text fields, checkboxes, dropdowns. |
+| `ui_wait(automation_id, timeout, title_or_handle)` | Wait for a UI element to appear. Polls UIA tree until found or timeout. |
 
 ### System
 
 | Tool | Description |
 |------|-------------|
-| `shell_run(command, timeout, cwd)` | Run a shell command and return output. |
-| `launch_app(name, args)` | Launch an application by name. |
+| `shell_run(command, timeout, cwd)` | Run shell command, return output. |
+| `launch_app(name, args)` | Launch application by name. |
 | `process_list(name_filter)` | List running processes. |
-| `process_kill(pid, force)` | Kill a process by PID. |
+| `process_kill(pid, force)` | Kill process by PID. |
 | `file_read(path, lines)` | Read a file. |
-| `file_write(path, content)` | Write a file. |
+| `file_write(path, content)` | Write a file. Creates parent dirs. |
 | `file_list(path, pattern)` | List files in a directory. |
-| `file_exists(path)` | Check if a file/directory exists. |
-| `action_trace(clear, last_n)` | Get the action trace log (records every tool call for crash diagnosis). |
+| `file_exists(path)` | Check if file/directory exists. |
+| `action_trace(clear, last_n)` | Action trace log — every tool call recorded for crash diagnosis. Persist to disk via `TRACE_LOG_PATH`. |
 
 ## Multi-Monitor
 
-Uses `ImageGrab.grab(all_screens=True)` to support multi-monitor setups. Use `monitor=1` or `monitor=2` to target a specific display, or `monitor=0` (default) for all screens.
+Uses `ImageGrab.grab(all_screens=True)` for multi-monitor setups. `monitor=1` or `monitor=2` for specific display, `monitor=0` (default) for all.
 
 ## Template Matching Methods
 
 ### Multi-Scale Template Matching (`method="template"`)
 
 Brute-force pixel correlation at 7 scales `[0.75, 0.8, 0.9, 1.0, 1.1, 1.2, 1.25]`.
-Fast for exact matches but breaks on rotation and large scale differences.
+Results are NMS-deduplicated to prevent overlapping detections.
 
 ### ORB Feature Matching (`method="feature"`)
 
-Detects ORB keypoints, matches with BFMatcher + Lowe ratio test (0.75), then uses
-`findHomography(RANSAC)` to project template corners onto the screen. Resilient to
-rotation, scale changes, and partial occlusion. Confidence = inlier ratio.
+ORB keypoints → BFMatcher + Lowe ratio test (0.75) → findHomography(RANSAC) →
+perspectiveTransform for bounding box. Resilient to rotation, scale, partial occlusion.
 
 ### Auto Mode (`method="auto"`, default)
 
-Tries ORB feature matching first. If it fails (not enough keypoints, low confidence),
-falls back to multi-scale template matching. Best of both worlds.
+ORB first, fall back to template matching. Best of both worlds.
 
-## How It Works: find_elements
+## OCR Pipeline
 
-Template-free element detection in three steps:
+Three-tier fallback chain:
 
-1. **Parse** — Extract color and shape keywords from the query string
-2. **Detect** — Apply the appropriate OpenCV pipeline:
-   - **Color only**: HSV color masking → contour detection → area filter
-   - **Shape only**: Canny edge detection → contour detection → shape classification (approxPolyDP for rectangles, circularity > 0.85 for circles)
-   - **Color + shape**: HSV mask → contours → shape filter on masked regions
-   - **Default**: Edge detection → all significant contours
-3. **Deduplicate** — IoU-based non-max suppression removes overlapping detections
+1. **Remote RapidOCR** (HTTP) — fastest, <100ms, requires OCR_SERVICE_URL host
+2. **Local ONNX** (`rapidocr-onnxruntime`) — no network needed, returns structured bounding boxes
+3. **Vision model** (Ollama/NVIDIA NIM) — slowest, best for Q&A about screen content
 
-Returns bounding boxes with center coordinates for clicking.
+## UIA Workflow for Native Apps
+
+For form-fill or data-extraction over native Windows apps:
+
+1. `window_enumerate_controls(title)` — see all controls with their IDs and rects
+2. `ui_find(name="Username", control_type="Edit")` — find elements without knowing IDs
+3. `ui_get_value(automation_id)` — read current text/value
+4. `click_by_automation_id(automation_id, action="invoke")` — click buttons
+5. `ui_wait(automation_id, timeout=5)` — wait for elements to appear
+6. `accessibility_tree(title, depth=3)` — full tree for complex navigation

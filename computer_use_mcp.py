@@ -69,6 +69,7 @@ _COLOR_HSV_RANGES = {
 # In-memory deque recording every tool call for crash diagnosis.
 
 _action_trace = deque(maxlen=100)
+TRACE_LOG_PATH = os.getenv("TRACE_LOG_PATH", "")  # If set, persist trace to JSONL file
 
 
 def _trace(tool_name, result, elapsed=None):
@@ -81,6 +82,12 @@ def _trace(tool_name, result, elapsed=None):
     else:
         entry["result_preview"] = str(result)[:200]
     _action_trace.append(entry)
+    if TRACE_LOG_PATH:
+        try:
+            with open(TRACE_LOG_PATH, "a", encoding="utf-8") as f:
+                f.write(json.dumps(entry) + "\n")
+        except Exception:
+            pass
 
 
 # ── RapidOCR Remote Service ───────────────────────────────────────────────────
@@ -220,7 +227,8 @@ def _vision_call_nvidia(img, question):
 
 def _find_window(title_or_handle):
     """Resolve a title substring or handle int to a window handle.
-    Returns (hwnd, title) or (None, error_msg)."""
+    Returns (hwnd, title) or (None, error_msg).
+    Prefers exact match, then closest by edit distance."""
     import win32gui
     if isinstance(title_or_handle, int):
         title = win32gui.GetWindowText(title_or_handle)
@@ -237,11 +245,21 @@ def _find_window(title_or_handle):
     win32gui.EnumWindows(callback, None)
     if not results:
         return None, f"No visible window matching '{title_or_handle}'."
-    # Prefer exact match, then first match
+    # Prefer exact match
     for hwnd, title in results:
         if title.lower() == filter_lower:
             return hwnd, title
-    return results[0]
+    # Rank by edit distance (Levenshtein-like: length diff + differing chars)
+    def _edit_dist(a, b):
+        len_diff = abs(len(a) - len(b))
+        common = sum(1 for c1, c2 in zip(a, b) if c1 == c2)
+        return len_diff + max(len(a), len(b)) - common
+    scored = [(hwnd, title, _edit_dist(filter_lower, title.lower())) for hwnd, title in results]
+    scored.sort(key=lambda x: x[2])
+    # Warn if multiple matches
+    if len(scored) > 1 and scored[0][2] == scored[1][2]:
+        pass  # Ambiguous, but still pick first
+    return scored[0][0], scored[0][1]
 
 
 # ── Monitor ──────────────────────────────────────────────────────────────────────
@@ -270,9 +288,11 @@ def get_monitors() -> dict:
 # ── Vision ──────────────────────────────────────────────────────────────────────
 
 @mcp.tool()
-def computer_screenshot(monitor: int = 0, region: str = "") -> dict:
+def computer_screenshot(monitor: int = 0, region: str = "",
+                       base64: bool = False) -> dict:
     """Take a screenshot. Use monitor=0 for all screens, 1+ for specific monitor.
     Optionally crop with region='x,y,w,h'.
+    Set base64=True to include a data:image/png;base64,... string for remote clients.
 
     Returns path and dimensions."""
     img_dir = DATA_DIR / "images"
@@ -293,7 +313,12 @@ def computer_screenshot(monitor: int = 0, region: str = "") -> dict:
             pass
 
     img.save(str(path))
-    return {"path": str(path), "width": img.width, "height": img.height}
+    result = {"path": str(path), "width": img.width, "height": img.height}
+    if base64:
+        buf = BytesIO()
+        img.save(buf, format="PNG")
+        result["base64"] = f"data:image/png;base64,{base64.b64encode(buf.getvalue()).decode()}"
+    return result
 
 
 @mcp.tool()
@@ -357,8 +382,11 @@ def _match_template_method(screen_cv, tpl_pil, threshold, multi_scale):
         result = cv2.matchTemplate(screen_cv, tpl_scaled, cv2.TM_CCOEFF_NORMED)
         locs = np.where(result >= threshold)
         points = list(zip(locs[1].tolist(), locs[0].tolist()))
-        best_result["count"] = len(points)
-        best_result["all_matches"] = [{"x": int(p[0]), "y": int(p[1])} for p in points]
+        # Apply NMS to remove overlapping matches
+        tw, th = tpl_scaled.shape[1], tpl_scaled.shape[0]
+        nms_points = _nms_template_points(points, tw, th, overlap=0.3)
+        best_result["count"] = len(nms_points)
+        best_result["all_matches"] = [{"x": int(p[0]), "y": int(p[1])} for p in nms_points]
 
     return best_result
 
@@ -427,6 +455,28 @@ def _match_feature_method(screen_cv, tpl_cv, threshold):
         "inliers": inliers,
         "total_good": len(good),
     }
+
+
+def _nms_template_points(points, tw, th, overlap=0.3):
+    """NMS for template matching points. Each point is (x, y) top-left of template."""
+    if not points:
+        return []
+    points.sort(key=lambda p: p[1])  # sort by y
+    keep = []
+    for px, py in points:
+        too_close = False
+        for kx, ky in keep:
+            ix1 = max(px, kx)
+            iy1 = max(py, ky)
+            ix2 = min(px + tw, kx + tw)
+            iy2 = min(py + th, ky + th)
+            inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+            if tw * th > 0 and inter / (tw * th) > overlap:
+                too_close = True
+                break
+        if not too_close:
+            keep.append((px, py))
+    return keep
 
 
 @mcp.tool()
@@ -648,7 +698,7 @@ def _apply_color_mask(screen_cv, color_name):
         return cv2.inRange(hsv, np.array(lo), np.array(hi))
 
 
-def _detect_by_color(screen_cv, color_name, min_area):
+def _detect_by_color(screen_cv, color_name, min_area, screen_area):
     """Detect regions matching a color. Returns list of element dicts."""
     import cv2
 
@@ -663,15 +713,19 @@ def _detect_by_color(screen_cv, color_name, min_area):
         if area < min_area:
             continue
         x, y, w, h = cv2.boundingRect(cnt)
+        # Score: solid color fill ratio (contour area / bounding box area)
+        bbox_area = w * h
+        fill_ratio = area / bbox_area if bbox_area > 0 else 0
         elements.append({
             "x": x, "y": y, "width": w, "height": h,
             "center_x": x + w // 2, "center_y": y + h // 2,
             "color": color_name, "shape": None, "area": int(area),
+            "score": round(fill_ratio, 3),
         })
     return elements
 
 
-def _detect_by_shape(screen_cv, shape_name, min_area):
+def _detect_by_shape(screen_cv, shape_name, min_area, screen_area):
     """Detect contours matching a shape. Returns list of element dicts."""
     import cv2
     import numpy as np
@@ -690,26 +744,29 @@ def _detect_by_shape(screen_cv, shape_name, min_area):
         perimeter = cv2.arcLength(cnt, True)
 
         detected_shape = None
+        score = 0.0
         if shape_name == "rectangle":
-            # approxPolyDP: 4 vertices = rectangle-ish
             approx = cv2.approxPolyDP(cnt, 0.02 * perimeter, True)
             if len(approx) == 4:
                 detected_shape = "rectangle"
+                # Score: how close to a perfect rectangle (angle deviation)
+                score = 0.8
         elif shape_name == "circle":
-            # Circularity check
             if perimeter > 0:
                 circularity = 4 * np.pi * area / (perimeter * perimeter)
                 if circularity > 0.85:
                     detected_shape = "circle"
+                    score = round(circularity, 3)
         elif shape_name == "blob":
-            # Any significant contour
             detected_shape = "blob"
+            score = 0.5
 
         if detected_shape:
             elements.append({
                 "x": x, "y": y, "width": w, "height": h,
                 "center_x": x + w // 2, "center_y": y + h // 2,
                 "color": None, "shape": detected_shape, "area": int(area),
+                "score": score,
             })
 
     return elements
@@ -737,24 +794,31 @@ def _detect_by_color_shape(screen_cv, color_name, shape_name, min_area):
 
         match = False
         detected_shape = None
+        score = 0.0
         if shape_name == "rectangle":
             approx = cv2.approxPolyDP(cnt, 0.02 * perimeter, True)
             match = len(approx) == 4
             detected_shape = "rectangle"
+            bbox_area = w * h
+            fill_ratio = area / bbox_area if bbox_area > 0 else 0
+            score = round(fill_ratio, 3)
         elif shape_name == "circle":
             if perimeter > 0:
                 circularity = 4 * np.pi * area / (perimeter * perimeter)
                 match = circularity > 0.85
                 detected_shape = "circle"
+                score = round(circularity, 3)
         elif shape_name == "blob":
             match = True
             detected_shape = "blob"
+            score = 0.5
 
         if match:
             elements.append({
                 "x": x, "y": y, "width": w, "height": h,
                 "center_x": x + w // 2, "center_y": y + h // 2,
                 "color": color_name, "shape": detected_shape, "area": int(area),
+                "score": score,
             })
 
     return elements
@@ -779,6 +843,7 @@ def _detect_default(screen_cv, min_area):
             "x": x, "y": y, "width": w, "height": h,
             "center_x": x + w // 2, "center_y": y + h // 2,
             "color": None, "shape": None, "area": int(area),
+            "score": 0.5,
         })
     return elements
 
@@ -841,23 +906,24 @@ def find_elements(query: str, region: str = "", min_area: int = 500,
 
     screen_cv = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
     parsed = _parse_element_query(query)
+    screen_area = screen_cv.shape[0] * screen_cv.shape[1]
 
     elements = []
     if parsed["mode"] == "color_shape":
-        # For each color+shape combination
         for color in parsed["colors"]:
             for shape in parsed["shapes"]:
                 elements.extend(_detect_by_color_shape(screen_cv, color, shape, min_area))
     elif parsed["mode"] == "color":
         for color in parsed["colors"]:
-            elements.extend(_detect_by_color(screen_cv, color, min_area))
+            elements.extend(_detect_by_color(screen_cv, color, min_area, screen_area))
     elif parsed["mode"] == "shape":
         for shape in parsed["shapes"]:
-            elements.extend(_detect_by_shape(screen_cv, shape, min_area))
+            elements.extend(_detect_by_shape(screen_cv, shape, min_area, screen_area))
     else:
         elements = _detect_default(screen_cv, min_area)
 
     elements = _nms_elements(elements)
+    elements.sort(key=lambda e: e.get("score", 0), reverse=True)
 
     return {
         "count": len(elements),
@@ -904,6 +970,16 @@ def click_element(query: str, index: int = 0, min_area: int = 500,
 
 
 # ── Mouse ───────────────────────────────────────────────────────────────────────
+
+@mcp.tool()
+def mouse_position() -> dict:
+    """Get the current mouse cursor position on screen.
+
+    Returns the x, y coordinates of the mouse pointer."""
+    import pyautogui
+    x, y = pyautogui.position()
+    return {"x": x, "y": y}
+
 
 @mcp.tool()
 def computer_click(x: int, y: int, button: str = "left", clicks: int = 1) -> dict:
@@ -1297,13 +1373,14 @@ def screen_diff(region: str = "", baseline_path: str = "",
 
 @mcp.tool()
 def screen_ocr(region: str = "", question: str = "") -> str:
-    """Extract text from the screen. Uses RapidOCR remote service for fast OCR.
-    Falls back to vision model only when a question is asked.
+    """Extract text from the screen. Three-tier OCR: remote RapidOCR → local ONNX → vision model.
+    Falls back to vision model when a question is asked.
 
     Args:
         region: Region to OCR as 'x,y,w,h'. Empty = full screen.
         question: Optional specific question (e.g. 'What is the price shown?')
     """
+    import numpy as np
     t0 = time.time()
     bbox = None
     if region:
@@ -1338,9 +1415,38 @@ def screen_ocr(region: str = "", question: str = "") -> str:
             _trace("screen_ocr", {"rapid_ocr": True, "lines": result["lines"]}, time.time() - t0)
             return result["text"]
     except Exception:
+        pass  # Fall through to local OCR
+
+    # Tier 2: Local RapidOCR (rapidocr-onnxruntime) if installed
+    try:
+        from rapidocr_onnxruntime import RapidOCR
+        if not hasattr(screen_ocr, "_local_ocr"):
+            screen_ocr._local_ocr = RapidOCR()
+        engine = screen_ocr._local_ocr
+        img_array = np.array(img)
+        results, _ = engine(img_array)
+        if results:
+            words = []
+            lines = []
+            for r in results:
+                bbox = r[0]  # [[x1,y1],[x2,y2],[x3,y3],[x4,y4]]
+                text_val = r[1][0]
+                confidence = round(r[1][1], 3)
+                cx = int((bbox[0][0] + bbox[2][0]) / 2)
+                cy = int((bbox[0][1] + bbox[2][1]) / 2)
+                words.append({"text": text_val, "box": bbox, "confidence": confidence,
+                              "center_x": cx, "center_y": cy})
+                lines.append(text_val)
+            _trace("screen_ocr", {"local_ocr": True, "lines": len(lines)}, time.time() - t0)
+            # Return structured output
+            structured = {"text": "\n".join(lines), "words": words, "line_count": len(lines)}
+            return json.dumps(structured)
+    except ImportError:
+        pass
+    except Exception:
         pass  # Fall through to vision model
 
-    # Fallback: vision model
+    # Tier 3: Vision model fallback
     prompt = "Extract all visible text from this image. Return only the text content, preserving layout."
     result = _vision_call(img, prompt)
     _trace("screen_ocr", {"vision_model": True}, time.time() - t0)
@@ -1413,6 +1519,42 @@ def clipboard_set_image(path: str) -> dict:
         return {"copied": str(p), "width": img.width, "height": img.height}
     except Exception as e:
         return {"error": f"Failed to copy image: {e}"}
+
+
+# ── Clipboard Text ────────────────────────────────────────────────────────────
+
+@mcp.tool()
+def clipboard_get_text() -> dict:
+    """Get the current text content from the system clipboard."""
+    import win32clipboard
+    try:
+        win32clipboard.OpenClipboard()
+        try:
+            text = win32clipboard.GetClipboardData(win32clipboard.CF_UNICODETEXT)
+        except Exception:
+            text = ""
+        win32clipboard.CloseClipboard()
+        return {"text": text}
+    except Exception as e:
+        return {"error": f"Clipboard access error: {e}"}
+
+
+@mcp.tool()
+def clipboard_set_text(text: str) -> dict:
+    """Copy text to the system clipboard.
+
+    Args:
+        text: Text to place on the clipboard
+    """
+    import win32clipboard
+    try:
+        win32clipboard.OpenClipboard()
+        win32clipboard.EmptyClipboard()
+        win32clipboard.SetClipboardData(win32clipboard.CF_UNICODETEXT, text)
+        win32clipboard.CloseClipboard()
+        return {"copied": len(text), "preview": text[:100]}
+    except Exception as e:
+        return {"error": f"Failed to set clipboard: {e}"}
 
 
 # ── Accessibility Tree ─────────────────────────────────────────────────────────
@@ -1532,6 +1674,180 @@ def click_by_automation_id(automation_id: str, title_or_handle: str = "",
         return {"clicked": automation_id, "action": action}
     except Exception as e:
         return {"error": f"UIA click error: {e}"}
+
+
+def _get_uia_window(title_or_handle):
+    """Resolve title/handle to a pywinauto UIA window, or (None, error_msg)."""
+    from pywinauto import Desktop
+    try:
+        desktop = Desktop(backend="uia")
+        if title_or_handle.strip():
+            handle_str = title_or_handle.strip()
+            try:
+                hwnd = int(handle_str)
+                return desktop.window(handle=hwnd), None
+            except ValueError:
+                return desktop.window(title_re=".*" + re.escape(handle_str) + ".*"), None
+        return desktop.top_window(), None
+    except Exception as e:
+        return None, str(e)
+
+
+def _find_uia_by_id(element, target_id):
+    """Walk UIA tree to find element by AutomationId."""
+    try:
+        if element.element_info.automation_id == target_id:
+            return element
+    except Exception:
+        pass
+    try:
+        for child in element.children():
+            found = _find_uia_by_id(child, target_id)
+            if found:
+                return found
+    except Exception:
+        pass
+    return None
+
+
+@mcp.tool()
+def ui_find(name: str = "", control_type: str = "",
+            title_or_handle: str = "", depth: int = 10) -> dict:
+    """Find UI elements by name (fuzzy) and/or control type. No AutomationId needed.
+    Searches the UIA tree and returns matching elements with their AutomationIds and rects.
+
+    Args:
+        name: Element name/text to search for (substring match)
+        control_type: Control type filter (e.g. 'Button', 'Edit', 'Text', 'CheckBox', 'ComboBox')
+        title_or_handle: Window to search in (empty = foreground)
+        depth: Max tree depth (default 10)
+    """
+    window, err = _get_uia_window(title_or_handle)
+    if err:
+        return {"error": err}
+
+    matches = []
+    name_lower = name.lower() if name else ""
+
+    def _walk(element, d):
+        if d > depth:
+            return
+        try:
+            info = element.element_info
+            el_name = (info.name or "").lower()
+            el_type = info.class_name or ""
+            match = True
+            if name_lower and name_lower not in el_name:
+                match = False
+            if control_type and control_type.lower() not in el_type.lower():
+                match = False
+            if match and (name_lower or control_type):
+                entry = {
+                    "name": (info.name or "")[:100],
+                    "type": el_type,
+                    "automation_id": info.automation_id or "",
+                    "depth": d,
+                }
+                rect = info.rectangle
+                if rect:
+                    entry["rect"] = {"left": rect.left, "top": rect.top,
+                                    "right": rect.right, "bottom": rect.bottom}
+                    entry["center_x"] = (rect.left + rect.right) // 2
+                    entry["center_y"] = (rect.top + rect.bottom) // 2
+                matches.append(entry)
+        except Exception:
+            return
+        try:
+            for child in element.children():
+                _walk(child, d + 1)
+        except Exception:
+            pass
+
+    _walk(window, 0)
+    return {"count": len(matches), "matches": matches[:50]}
+
+
+@mcp.tool()
+def ui_get_value(automation_id: str, title_or_handle: str = "") -> dict:
+    """Get the current value/text of a UI element by its AutomationId.
+    Useful for reading text fields, checkboxes, dropdowns, progress bars.
+
+    Args:
+        automation_id: The AutomationId of the target element
+        title_or_handle: Window to search in (empty = foreground)
+    """
+    window, err = _get_uia_window(title_or_handle)
+    if err:
+        return {"error": err}
+
+    elem = _find_uia_by_id(window, automation_id)
+    if not elem:
+        return {"error": f"AutomationId '{automation_id}' not found."}
+
+    try:
+        info = elem.element_info
+        result = {"automation_id": automation_id}
+        if info.name:
+            result["name"] = info.name[:100]
+        try:
+            result["value"] = elem.window_text()
+        except Exception:
+            pass
+        try:
+            val_pattern = info.get_current_value()
+            if val_pattern:
+                result["current_value"] = str(val_pattern)[:200]
+        except Exception:
+            pass
+        try:
+            result["is_enabled"] = info.enabled
+        except Exception:
+            pass
+        try:
+            result["class_name"] = info.class_name
+        except Exception:
+            pass
+        return result
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def ui_wait(automation_id: str, timeout: float = 10.0,
+            title_or_handle: str = "") -> dict:
+    """Wait for a UI element to appear by its AutomationId.
+    Polls the UIA tree until the element is found or timeout is reached.
+
+    Args:
+        automation_id: The AutomationId to wait for
+        timeout: Max seconds to wait (default 10)
+        title_or_handle: Window to search in (empty = foreground)
+    """
+    window, err = _get_uia_window(title_or_handle)
+    if err:
+        return {"error": err}
+
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        elem = _find_uia_by_id(window, automation_id)
+        if elem:
+            elapsed = round(time.time() - t0, 3)
+            try:
+                info = elem.element_info
+                rect = info.rectangle
+                return {
+                    "found": True,
+                    "automation_id": automation_id,
+                    "elapsed": elapsed,
+                    "name": (info.name or "")[:100],
+                    "rect": {"left": rect.left, "top": rect.top,
+                             "right": rect.right, "bottom": rect.bottom} if rect else None,
+                }
+            except Exception:
+                return {"found": True, "automation_id": automation_id, "elapsed": elapsed}
+        time.sleep(0.3)
+
+    return {"found": False, "automation_id": automation_id, "elapsed": timeout}
 
 
 # ── Shell / Process Tools ──────────────────────────────────────────────────────
@@ -1747,6 +2063,235 @@ def file_exists(path: str) -> dict:
     p = Path(path)
     return {"exists": p.exists(), "is_file": p.is_file(), "is_dir": p.is_dir(),
             "path": str(p)}
+
+
+# ── Screen Recording ─────────────────────────────────────────────────────────
+
+@mcp.tool()
+def screen_record(duration: float = 5.0, fps: int = 10, region: str = "",
+                 monitor: int = 0) -> dict:
+    """Record a short video of the screen for debugging agent replay.
+    Saves as AVI to data/videos/.
+
+    Args:
+        duration: Recording duration in seconds (default 5)
+        fps: Frames per second (default 10)
+        region: Optional crop region as 'x,y,w,h'
+        monitor: Monitor to record (0=all, 1+=specific)
+    """
+    import cv2
+    import numpy as np
+
+    vid_dir = DATA_DIR / "videos"
+    vid_dir.mkdir(parents=True, exist_ok=True)
+    ts = int(time.time())
+    path = vid_dir / f"record_{ts}.avi"
+
+    mon_img = _grab_monitor(monitor)
+    if mon_img is None:
+        return {"error": f"Invalid monitor index {monitor}."}
+
+    h, w = mon_img.height, mon_img.width
+    if region:
+        try:
+            parts = [int(p.strip()) for p in region.split(",")]
+            if len(parts) == 4:
+                w, h = parts[2], parts[3]
+        except ValueError:
+            pass
+
+    fourcc = cv2.VideoWriter_fourcc(*"XVID")
+    writer = cv2.VideoWriter(str(path), fourcc, fps, (w, h))
+
+    t0 = time.time()
+    frames = 0
+    while time.time() - t0 < duration:
+        img = _grab_monitor(monitor)
+        if img is None:
+            break
+        if region:
+            try:
+                parts = [int(p.strip()) for p in region.split(",")]
+                if len(parts) == 4:
+                    img = img.crop((parts[0], parts[1], parts[0] + parts[2], parts[1] + parts[3]))
+            except ValueError:
+                pass
+        frame = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+        writer.write(frame)
+        frames += 1
+        time.sleep(1.0 / fps)
+
+    writer.release()
+    return {"path": str(path), "frames": frames, "duration": round(time.time() - t0, 2),
+            "fps": fps, "resolution": {"width": w, "height": h}}
+
+
+# ── Text Finder ────────────────────────────────────────────────────────────────
+
+@mcp.tool()
+def find_on_screen_text(text: str, region: str = "", monitor: int = 0,
+                        case_sensitive: bool = False) -> dict:
+    """Find text on screen using OCR and return bounding boxes + click coordinates.
+    Combines RapidOCR with string search into one tool call.
+
+    Args:
+        text: Text string to search for on screen
+        region: Optional crop region as 'x,y,w,h'
+        monitor: Monitor to search (0=all, 1+=specific)
+        case_sensitive: Whether search is case sensitive (default False)
+    """
+    t0 = time.time()
+    bbox = None
+    if region:
+        try:
+            parts = [int(p.strip()) for p in region.split(",")]
+            if len(parts) == 4:
+                bbox = (parts[0], parts[1], parts[0] + parts[2], parts[1] + parts[3])
+        except ValueError:
+            return {"error": f"Invalid region format '{region}'."}
+
+    img = _grab(bbox=bbox)
+    if img is None:
+        return {"error": f"Invalid monitor index {monitor}."}
+
+    search = text if case_sensitive else text.lower()
+
+    # Try remote OCR first
+    try:
+        import numpy as np
+        buf = BytesIO()
+        img.save(buf, format="JPEG", quality=85)
+        b64 = base64.b64encode(buf.getvalue()).decode()
+        payload = json.dumps({"image": b64}).encode()
+        req = urllib.request.Request(
+            OCR_SERVICE_URL, data=payload,
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            result = json.loads(resp.read())
+        ocr_text = result.get("text", "")
+        _trace("find_on_screen_text", {"remote_ocr": True}, time.time() - t0)
+    except Exception:
+        # Fallback: local RapidOCR
+        try:
+            import numpy as np
+            from rapidocr_onnxruntime import RapidOCR
+            if not hasattr(find_on_screen_text, "_local_ocr"):
+                find_on_screen_text._local_ocr = RapidOCR()
+            engine = find_on_screen_text._local_ocr
+            ocr_results, _ = engine(np.array(img))
+            ocr_text = "\n".join(r[1][0] for r in ocr_results) if ocr_results else ""
+            _trace("find_on_screen_text", {"local_ocr": True}, time.time() - t0)
+        except Exception:
+            ocr_text = ""
+
+    if not ocr_text:
+        return {"found": False, "error": "OCR returned no text."}
+
+    # Search for the text string in OCR output
+    ocr_lower = ocr_text.lower() if not case_sensitive else ocr_text
+    matches = []
+    start = 0
+    while True:
+        idx = ocr_lower.find(search, start)
+        if idx == -1:
+            break
+        # Estimate position by character offset
+        lines_before = ocr_text[:idx].count("\n")
+        lines = ocr_text.split("\n")
+        line_idx = min(lines_before, len(lines) - 1)
+        line = lines[line_idx] if line_idx < len(lines) else ""
+        col_in_line = idx - (ocr_text[:idx].rfind("\n") + 1)
+        matches.append({
+            "index": idx,
+            "line": line.strip(),
+            "line_number": line_idx + 1,
+            "col": col_in_line,
+            "context": ocr_text[max(0, idx - 30):idx + len(text) + 30].strip(),
+        })
+        start = idx + 1
+
+    if not matches:
+        return {"found": False, "ocr_lines": ocr_text.count("\n") + 1, "ocr_preview": ocr_text[:500]}
+
+    return {
+        "found": True,
+        "count": len(matches),
+        "text": text,
+        "matches": matches,
+        "ocr_preview": ocr_text[:1000],
+    }
+
+
+# ── Window Controls Enumeration ────────────────────────────────────────────────
+
+@mcp.tool()
+def window_enumerate_controls(title_or_handle: str = "",
+                               control_type: str = "",
+                               depth: int = 15) -> dict:
+    """List all interactive controls in a window with their type, text, rect, and AutomationId.
+    The Win32 equivalent of a Playwright accessibility snapshot.
+
+    Args:
+        title_or_handle: Window title substring or handle (empty = foreground)
+        control_type: Optional filter (e.g. 'Button', 'Edit', 'CheckBox')
+        depth: Max tree depth (default 15)
+    """
+    from pywinauto import Desktop
+    window, err = _get_uia_window(title_or_handle)
+    if err:
+        return {"error": err}
+
+    controls = []
+    type_lower = control_type.lower() if control_type else ""
+
+    def _walk(element, d):
+        if d > depth:
+            return
+        try:
+            info = element.element_info
+            name = info.name or ""
+            el_type = info.class_name or ""
+            aid = info.automation_id or ""
+
+            # Only include elements that have a name, type, or automation_id
+            if name or aid:
+                if type_lower and type_lower not in el_type.lower():
+                    pass  # Skip non-matching types
+                else:
+                    entry = {
+                        "name": name[:100],
+                        "type": el_type,
+                        "automation_id": aid,
+                        "depth": d,
+                    }
+                    rect = info.rectangle
+                    if rect:
+                        entry["rect"] = {"left": rect.left, "top": rect.top,
+                                        "right": rect.right, "bottom": rect.bottom}
+                        entry["center_x"] = (rect.left + rect.right) // 2
+                        entry["center_y"] = (rect.top + rect.bottom) // 2
+                    try:
+                        entry["enabled"] = info.enabled
+                    except Exception:
+                        pass
+                    try:
+                        entry["visible"] = info.visible
+                    except Exception:
+                        pass
+                    controls.append(entry)
+        except Exception:
+            return
+        try:
+            for child in element.children():
+                _walk(child, d + 1)
+        except Exception:
+            pass
+
+    _walk(window, 0)
+    return {"window": title_or_handle or "foreground",
+            "count": len(controls),
+            "controls": controls[:100]}
 
 
 # ── Main ────────────────────────────────────────────────────────────────────────
