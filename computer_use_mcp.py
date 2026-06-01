@@ -1,12 +1,15 @@
-"""Computer Use MCP Server — PyAutoGUI + OpenCV + Ollama vision.
+"""Computer Use MCP Server — PyAutoGUI + OpenCV + Ollama/NVIDIA vision.
 
 Controls the local desktop (mouse, keyboard, screenshots, screen understanding,
 window management, pixel color, OCR, clipboard).
 Runs as stdio MCP server via FastMCP.
 
 Config via environment variables:
+    VISION_BACKEND         - Vision provider: "ollama" (default) or "nvidia"
     COMPUTER_VISION_MODEL  - Ollama vision model (default: qwen2.5vl:3b)
     OLLAMA_BASE            - Ollama API base URL (default: http://localhost:11434)
+    NVIDIA_VISION_URL      - NVIDIA NIM endpoint (default: https://ai.api.nvidia.com/v1/vlm/google/paligemma)
+    NVIDIA_API_KEY         - NVIDIA API bearer token
     VISION_TIMEOUT         - Vision API timeout seconds (default: 300)
     SCREEN_MAX_DIMENSION   - Max dimension for vision screenshots (default: 1280)
 """
@@ -28,6 +31,10 @@ mcp = FastMCP("computer-use")
 
 OLLAMA_BASE = os.getenv("OLLAMA_BASE", "http://localhost:11434")
 COMPUTER_VISION_MODEL = os.getenv("COMPUTER_VISION_MODEL", "qwen2.5vl:3b")
+NVIDIA_VISION_URL = os.getenv("NVIDIA_VISION_URL", "https://integrate.api.nvidia.com/v1/chat/completions")
+NVIDIA_VISION_MODEL = os.getenv("NVIDIA_VISION_MODEL", "meta/llama-3.2-90b-vision-instruct")
+NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY", "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")
+VISION_BACKEND = os.getenv("VISION_BACKEND", "nvidia")  # "ollama" or "nvidia"
 VISION_TIMEOUT = int(os.getenv("VISION_TIMEOUT", "300"))
 SCREEN_MAX_DIMENSION = int(os.getenv("SCREEN_MAX_DIMENSION", "1280"))
 DATA_DIR = Path(os.getenv("COMPUTER_USE_DATA_DIR", "data"))
@@ -91,6 +98,14 @@ def _get_monitors_raw():
 
 
 def _vision_call(img, question):
+    """Send a PIL image to vision model, return text response.
+    Routes to Ollama or NVIDIA NIM based on VISION_BACKEND."""
+    if VISION_BACKEND == "nvidia" and NVIDIA_API_KEY:
+        return _vision_call_nvidia(img, question)
+    return _vision_call_ollama(img, question)
+
+
+def _vision_call_ollama(img, question):
     """Send a PIL image to Ollama vision model, return text response."""
     if max(img.width, img.height) > SCREEN_MAX_DIMENSION:
         scale = SCREEN_MAX_DIMENSION / max(img.width, img.height)
@@ -113,6 +128,48 @@ def _vision_call(img, question):
         return data.get("message", {}).get("content", "No response from vision model.")
     except Exception as e:
         return f"Vision model error: {e}"
+
+
+def _vision_call_nvidia(img, question):
+    """Send a PIL image to NVIDIA NIM vision model, return text response."""
+    if max(img.width, img.height) > SCREEN_MAX_DIMENSION:
+        scale = SCREEN_MAX_DIMENSION / max(img.width, img.height)
+        img = img.resize((int(img.width * scale), int(img.height * scale)))
+    buf = BytesIO()
+    img.save(buf, format="JPEG", quality=85)
+    b64 = base64.b64encode(buf.getvalue()).decode()
+    payload = json.dumps({
+        "model": NVIDIA_VISION_MODEL,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": question},
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
+                ],
+            }
+        ],
+        "max_tokens": 512,
+        "temperature": 0.5,
+        "stream": False,
+    }).encode()
+    req = urllib.request.Request(
+        NVIDIA_VISION_URL, data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {NVIDIA_API_KEY}",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=VISION_TIMEOUT) as resp:
+            data = json.loads(resp.read())
+        choices = data.get("choices", [])
+        if choices:
+            return choices[0].get("message", {}).get("content", "No response from NVIDIA vision model.")
+        return f"No response from NVIDIA vision model: {data}"
+    except Exception as e:
+        return f"NVIDIA vision model error: {e}"
 
 
 def _find_window(title_or_handle):
