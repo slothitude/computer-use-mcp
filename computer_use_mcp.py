@@ -36,11 +36,18 @@ OLLAMA_BASE = os.getenv("OLLAMA_BASE", "http://localhost:11434")
 COMPUTER_VISION_MODEL = os.getenv("COMPUTER_VISION_MODEL", "qwen2.5vl:3b")
 NVIDIA_VISION_URL = os.getenv("NVIDIA_VISION_URL", "https://integrate.api.nvidia.com/v1/chat/completions")
 NVIDIA_VISION_MODEL = os.getenv("NVIDIA_VISION_MODEL", "meta/llama-3.2-90b-vision-instruct")
-NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY", "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")
+NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY", "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")  # fallback; primary source is .mcp.json env
 VISION_BACKEND = os.getenv("VISION_BACKEND", "nvidia")  # "ollama" or "nvidia"
 VISION_TIMEOUT = int(os.getenv("VISION_TIMEOUT", "300"))
 SCREEN_MAX_DIMENSION = int(os.getenv("SCREEN_MAX_DIMENSION", "1280"))
 DATA_DIR = Path(os.getenv("COMPUTER_USE_DATA_DIR", "data"))
+
+# ── Startup Config Dump (to stderr, visible in MCP logs) ────────────────────────
+import sys as _sys
+_key_src = "env" if os.environ.get("NVIDIA_API_KEY") else "default"
+_backend_src = "env" if os.environ.get("VISION_BACKEND") else "default"
+print(f"[computer-use] VISION_BACKEND={VISION_BACKEND} (from {_backend_src})", file=_sys.stderr)
+print(f"[computer-use] NVIDIA_API_KEY={'***set***' if NVIDIA_API_KEY else '(empty)'} (from {_key_src})", file=_sys.stderr)
 
 MULTI_SCALE_STEPS = [0.75, 0.8, 0.9, 1.0, 1.1, 1.2, 1.25]
 

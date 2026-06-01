@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "computer-use": {
+      "type": "stdio",
+      "command": "python",
+      "args": [
+        "C:/Users/aaron/computer-use-mcp/computer_use_mcp.py"
+      ],
+      "env": {
+        "VISION_BACKEND": "nvidia",
+        "NVIDIA_API_KEY": "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"
+      }
+    }
+  }
+}
