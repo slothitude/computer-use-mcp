@@ -289,10 +289,10 @@ def get_monitors() -> dict:
 
 @mcp.tool()
 def computer_screenshot(monitor: int = 0, region: str = "",
-                       base64: bool = False) -> dict:
+                       inline_b64: bool = False) -> dict:
     """Take a screenshot. Use monitor=0 for all screens, 1+ for specific monitor.
     Optionally crop with region='x,y,w,h'.
-    Set base64=True to include a data:image/png;base64,... string for remote clients.
+    Set inline_b64=True to include a data:image/png;base64,... string for remote clients.
 
     Returns path and dimensions."""
     img_dir = DATA_DIR / "images"
@@ -314,7 +314,7 @@ def computer_screenshot(monitor: int = 0, region: str = "",
 
     img.save(str(path))
     result = {"path": str(path), "width": img.width, "height": img.height}
-    if base64:
+    if inline_b64:
         buf = BytesIO()
         img.save(buf, format="PNG")
         result["base64"] = f"data:image/png;base64,{base64.b64encode(buf.getvalue()).decode()}"
@@ -1688,7 +1688,12 @@ def _get_uia_window(title_or_handle):
                 return desktop.window(handle=hwnd), None
             except ValueError:
                 return desktop.window(title_re=".*" + re.escape(handle_str) + ".*"), None
-        return desktop.top_window(), None
+        # Get foreground window via Win32 API
+        import win32gui
+        fg_hwnd = win32gui.GetForegroundWindow()
+        if fg_hwnd:
+            return desktop.window(handle=fg_hwnd), None
+        return None, "No foreground window found."
     except Exception as e:
         return None, str(e)
 
